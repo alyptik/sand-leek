@@ -141,6 +141,7 @@ work(void *arg) {
 		tmp_data = der_data;
 		if (i2d_RSAPublicKey(rsa_key, &tmp_data) != der_length) {
 			fprintf(stderr, "DER formatting failed\n");
+			free(der_data);
 			goto STOP;
 		}
 
@@ -155,7 +156,7 @@ work(void *arg) {
 
 			e_big_endian = htobe32(e);
 			SHA1_Update(&working_sha_c, &e_big_endian, EXPONENT_SIZE_BYTES);
-			SHA1_Final((unsigned char*)&sha, &working_sha_c);
+			SHA1_Final(sha, &working_sha_c);
 
 #ifdef __SSSE3__
 			onion_base32_ssse3(onion, sha);
