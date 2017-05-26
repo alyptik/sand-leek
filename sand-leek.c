@@ -34,10 +34,11 @@ typedef struct sha_list_tag {
 static char *search;
 static size_t search_len;
 sem_t working;
+
 volatile sha_list *sha_head;
 pthread_mutex_t head_lock, tail_lock;
-/* associated with the 'head_lock' mutex and the */
-/* predicate 'there is a sha hash in the queue' */
+/* associated with the 'head_lock' mutex with the */
+/* predicate condition 'a sha hash in the queue' */
 pthread_cond_t list_ready;
 
 /* re-calculate the decryption key `d` for the given key
@@ -253,13 +254,21 @@ consume(void *arg) {
 	int sem_val;
 
 	while(sem_getvalue(&working, &sem_val) == 0 && sem_val == 0) {
+
+		/* head of sha list critical section */
+		pthread_mutex_lock(&head_lock);
+
+		/* test predicate in a loop to guard against spurious wakeups */
 		while (!sha_head) {
-
-			/* head of sha list critical section */
-			pthread_mutex_lock(&head_lock);
-			/* wait on list to be populated */
+			/* wait on list to be populate */
 			pthread_cond_wait(&list_ready, &head_lock);
+		}
 
+		/* retest predicate */
+		if (!sha_head) {
+			/* if false, unlock mutex and restart loop */
+			pthread_mutex_unlock(&head_lock);
+		} else {
 			memcpy(onion, (const void *)sha_head->onion, sizeof sha_head->onion);
 			memcpy(sha, (const void *)sha_head->sha, sizeof sha_head->sha);
 			e = sha_head->e;
@@ -380,6 +389,7 @@ main(int argc, char **argv) {
 	pthread_t *producers = NULL;
 	pthread_t *consumers = NULL;
 	unsigned long volatile *khashes = NULL;
+	sha_list *sha_tmp;
 
 	pthread_mutex_init(&head_lock, NULL);
 	pthread_mutex_init(&tail_lock, NULL);
@@ -466,6 +476,18 @@ main(int argc, char **argv) {
 		pthread_join(producers[i], NULL);
 		pthread_join(consumers[i], NULL);
 	}
+
+	pthread_mutex_destroy(&head_lock);
+	pthread_mutex_destroy(&tail_lock);
+	pthread_cond_destroy(&list_ready);
+
+	sha_tmp = sha_head;
+	while (sha_tmp->next) {
+		sha_tmp = sha_tmp->next;
+		free(sha_head);
+		sha_head = sha_tmp;
+	}
+	free(sha_head);
 
 	return 0;
 }
