@@ -23,9 +23,19 @@
 
 #define RSA_KEY_BITS          1024
 
+typedef struct sha_list_tag {
+	unsigned char sha[20];
+	struct sha_list_tag *next;
+} sha_list;
+
 static char *search;
 static size_t search_len;
 sem_t working;
+sha_list head;
+pthread_mutex_t head_lock, tail_lock;
+/* associated with the 'head_lock' mutex and the */
+/* predicate 'there is a sha hash in the queue' */
+pthread_cond_t list_ready;
 
 /* re-calculate the decryption key `d` for the given key
  * the product of e and d must be congruent to 1, and since we are messing
@@ -90,7 +100,7 @@ key_update_d(RSA *rsa_key) {
 }
 
 void*
-work(void *arg) {
+produce(void *arg) {
 	char onion[17];
 #ifdef __SSSE3__
 	char check_onion[17]; /* buffer for onion address used in sanity check */
@@ -174,7 +184,28 @@ work(void *arg) {
 				if (sem_val > 0)
 					goto STOP;
 			}
-			if(strncmp(onion, search, search_len) == 0) {
+			/* select next odd exponent */
+			e += 2;
+		}
+	}
+STOP:
+	sem_post(&working);
+	return NULL;
+}
+
+void *
+consume(void *arg) {
+	char onion[17];
+	int sem_val = 0;
+
+	/* read head of sha list critical section */
+	mutex_lock(&head_lock);
+	
+
+	memcpy(onion, arg, sizeof onion);
+
+	while(sem_getvalue(&working, &sem_val) == 0 && sem_val == 0) {
+		if(strncmp(onion, search, search_len) == 0) {
 #ifdef __SSSE3__
 				/* sanity check: my SSE algorithm is still experimental, so
 				  * check it with old trusty */
@@ -223,13 +254,7 @@ work(void *arg) {
 					ERR_print_errors_fp(stderr);
 				}
 			}
-			/* select next odd exponent */
-			e += 2;
-		}
 	}
-STOP:
-	sem_post(&working);
-	return NULL;
 }
 
 void
@@ -286,7 +311,8 @@ main(int argc, char **argv) {
 	int thread_count = 1;
 	int i = 0;
 	ssize_t offset = 0;
-	pthread_t *workers = NULL;
+	pthread_t *producers = NULL;
+	pthread_t *consumers = NULL;
 	unsigned long volatile *khashes = NULL;
 
 	while ((opt = getopt(argc, argv, "t:s:V")) != -1) {
@@ -322,24 +348,44 @@ main(int argc, char **argv) {
 		return 1;
 	}
 
-	workers = calloc(thread_count, sizeof(workers[0]));
-	if (!workers) {
-		perror("worker thread calloc");
+	/* allocate producers/consumers in a 3:1 ratio */
+	producers = calloc((thread_count / 4), sizeof *producers);
+	if (!producers) {
+		perror("producer thread calloc");
+		return 1;
+	}
+
+	consumers = calloc((thread_count - (thread_count / 4)), sizeof *consumers);
+	if (!consumers) {
+		perror("consumer thread calloc");
+		free(producers);
 		return 1;
 	}
 
 	khashes = calloc(thread_count, sizeof(khashes[0]));
 	if (!khashes) {
 		perror("hash count array calloc");
-		free(workers);
+		free(producers);
+		free(consumers);
 		return 1;
 	}
 
 	sem_init(&working, 0, 0);
 
-	for (i = 0; i < thread_count; i++) {
-		if (pthread_create(&workers[i], NULL, work, (void*)&khashes[i])) {
-			perror("pthread_create");
+	for (i = 0; i < (thread_count / 4); i++) {
+		if (pthread_create(&producers[i], NULL, produce, (void*)&khashes[i])) {
+			perror("producers pthread_create");
+			free(producers);
+			free(consumers);
+			return 1;
+		}
+	}
+
+	for (i = 0; i < (thread_count - (thread_count / 4)); i++) {
+		if (pthread_create(&consumers[i], NULL, consume, (void*)&khashes[i])) {
+			perror("consumers pthread_create");
+			free(producers);
+			free(consumers);
 			return 1;
 		}
 	}
@@ -347,7 +393,8 @@ main(int argc, char **argv) {
 	monitor_progress(khashes, thread_count);
 
 	for (i = 0; i < thread_count; i++) {
-		pthread_join(workers[i], NULL);
+		pthread_join(producers[i], NULL);
+		pthread_join(consumers[i], NULL);
 	}
 
 	return 0;
