@@ -24,14 +24,17 @@
 #define RSA_KEY_BITS          1024
 
 typedef struct sha_list_tag {
+	char onion[17];
 	unsigned char sha[20];
+	unsigned long e;
+	RSA *rsa_key;
 	struct sha_list_tag *next;
 } sha_list;
 
 static char *search;
 static size_t search_len;
 sem_t working;
-sha_list head;
+volatile sha_list *sha_head;
 pthread_mutex_t head_lock, tail_lock;
 /* associated with the 'head_lock' mutex and the */
 /* predicate 'there is a sha hash in the queue' */
@@ -118,6 +121,7 @@ produce(void *arg) {
 	SHA_CTX sha_c;
 	SHA_CTX working_sha_c;
 	int sem_val = 0;
+	sha_list *sha_tail;
 
 	rsa_key = RSA_new();
 	if (!rsa_key) {
@@ -132,7 +136,6 @@ produce(void *arg) {
 	}
 
 	while(sem_getvalue(&working, &sem_val) == 0 && sem_val == 0) {
-		e = EXPONENT_MIN;
 		BN_set_word(bignum_e, e);
 		if (!RSA_generate_key_ex(rsa_key, RSA_KEY_BITS, bignum_e, NULL)) {
 			fprintf(stderr, "Failed to generate RSA key\n");
@@ -165,7 +168,7 @@ produce(void *arg) {
 			working_sha_c.num = sha_c.num;
 
 			e_big_endian = htobe32(e);
-			SHA1_Update(&working_sha_c, &e_big_endian, EXPONENT_SIZE_BYTES);
+			SHA1_Update(&working_sha_c, (const void *)&e_big_endian, EXPONENT_SIZE_BYTES);
 			SHA1_Final(sha, &working_sha_c);
 
 #ifdef __SSSE3__
@@ -184,6 +187,50 @@ produce(void *arg) {
 				if (sem_val > 0)
 					goto STOP;
 			}
+
+			/* head of sha list critical section */
+			pthread_mutex_lock(&head_lock);
+			if (!sha_head) {
+				sha_head = malloc(sizeof *sha_head);
+			}
+			sha_tail = sha_head;
+
+			/* tail of sha list critical section */
+			pthread_mutex_lock(&tail_lock);
+			if (!sha_tail->next) {
+				/* copy data into the structure and unlock mutexes */
+				memcpy(sha_tail->onion, (const void *)onion, sizeof onion);
+				memcpy(sha_tail->sha, (const void *)sha, sizeof sha);
+				sha_tail->e = e_big_endian;
+				sha_tail->rsa_key = rsa_key;
+				sha_tail->next = malloc(sizeof *sha_tail->next);
+				pthread_mutex_unlock(&tail_lock);
+				pthread_mutex_unlock(&head_lock);
+				/* signal the list is non-empty */
+				pthread_cond_broadcast(&list_ready);
+			} else {
+				sha_tail = sha_tail->next;
+				pthread_mutex_unlock(&tail_lock);
+				pthread_mutex_unlock(&head_lock);
+				/* signal the list is non-empty */
+				pthread_cond_broadcast(&list_ready);
+				/* walk list */
+				while (sha_tail->next) {
+					sha_tail = sha_tail->next;
+				}
+
+				/* tail of sha list critical section */
+				pthread_mutex_lock(&tail_lock);
+				/* copy data into the structure and unlock mutexes */
+				memcpy(sha_tail->onion, (const void *)onion, sizeof onion);
+				memcpy(sha_tail->onion, onion, sizeof onion);
+				memcpy(sha_tail->sha, sha, sizeof sha);
+				sha_tail->e = e_big_endian;
+				sha_tail->rsa_key = rsa_key;
+				sha_tail->next = malloc(sizeof *sha_tail->next);
+				pthread_mutex_unlock(&tail_lock);
+			}
+
 			/* select next odd exponent */
 			e += 2;
 		}
@@ -196,19 +243,34 @@ STOP:
 void *
 consume(void *arg) {
 	char onion[17];
-	int sem_val = 0;
-
-	/* read head of sha list critical section */
-	mutex_lock(&head_lock);
-	
-
-	memcpy(onion, arg, sizeof onion);
+#ifdef __SSSE3__
+	char check_onion[17]; /* buffer for onion address used in sanity check */
+#endif
+	unsigned char sha[20];
+	unsigned long e;
+	BIGNUM *bignum_e = NULL;
+	RSA *rsa_key = NULL;
+	int sem_val;
 
 	while(sem_getvalue(&working, &sem_val) == 0 && sem_val == 0) {
-		if(strncmp(onion, search, search_len) == 0) {
+		while (!sha_head) {
+
+			/* head of sha list critical section */
+			pthread_mutex_lock(&head_lock);
+			/* wait on list to be populated */
+			pthread_cond_wait(&list_ready, &head_lock);
+
+			memcpy(onion, (const void *)sha_head->onion, sizeof sha_head->onion);
+			memcpy(sha, (const void *)sha_head->sha, sizeof sha_head->sha);
+			e = sha_head->e;
+			rsa_key = sha_head->rsa_key;
+			sha_head = sha_head->next;
+			pthread_mutex_unlock(&head_lock);
+
+			if(strncmp(onion, search, search_len) == 0) {
 #ifdef __SSSE3__
 				/* sanity check: my SSE algorithm is still experimental, so
-				  * check it with old trusty */
+				 * check it with old trusty */
 				onion_base32(check_onion, sha);
 				check_onion[16] = '\0';
 				if (strcmp(check_onion, onion)) {
@@ -254,7 +316,11 @@ consume(void *arg) {
 					ERR_print_errors_fp(stderr);
 				}
 			}
+		}
 	}
+STOP:
+	sem_post(&working);
+	return NULL;
 }
 
 void
@@ -314,6 +380,10 @@ main(int argc, char **argv) {
 	pthread_t *producers = NULL;
 	pthread_t *consumers = NULL;
 	unsigned long volatile *khashes = NULL;
+
+	pthread_mutex_init(&head_lock, NULL);
+	pthread_mutex_init(&tail_lock, NULL);
+	pthread_cond_init(&list_ready, NULL);
 
 	while ((opt = getopt(argc, argv, "t:s:V")) != -1) {
 		switch (opt) {
