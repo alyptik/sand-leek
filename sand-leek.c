@@ -7,7 +7,6 @@
 #include <errno.h>
 #include <string.h>
 #include <endian.h>
-#include <assert.h>
 #include <openssl/bn.h>
 #include <openssl/rsa.h>
 #include <openssl/sha.h>
@@ -38,11 +37,11 @@ static char *search;
 static size_t search_len;
 sem_t working;
 
-sha_list *sha_head;
-pthread_mutex_t head_lock, tail_lock;
+static sha_list *sha_head;
+static pthread_mutex_t head_lock, tail_lock;
 /* associated with the 'head_lock' mutex with the */
 /* predicate condition 'a sha hash in the queue' */
-pthread_cond_t list_ready;
+static pthread_cond_t list_ready;
 
 /* re-calculate the decryption key `d` for the given key
  * the product of e and d must be congruent to 1, and since we are messing
@@ -189,7 +188,7 @@ produce(void *arg) {
 				/* copy data into the structure and unlock mutexes */
 				memcpy((void *)sha_tail->onion, (const void *)onion, sizeof onion);
 				memcpy((void *)sha_tail->sha, (const void *)sha, sizeof sha);
-				sha_tail->e = e_big_endian;
+				sha_tail->e = e;
 				sha_tail->rsa_key = rsa_key;
 				sha_tail->next = malloc(sizeof *sha_tail->next);
 				sha_head->next->next = NULL;
@@ -205,7 +204,7 @@ produce(void *arg) {
 				/* copy data into the structure and unlock mutexes */
 				memcpy((void *)sha_tail->onion, (const void *)onion, sizeof onion);
 				memcpy((void *)sha_tail->sha, (const void *)sha, sizeof sha);
-				sha_tail->e = e_big_endian;
+				sha_tail->e = e;
 				sha_tail->rsa_key = rsa_key;
 				sha_tail->next = malloc(sizeof *sha_tail->next);
 				sha_head->next->next = NULL;
@@ -259,12 +258,12 @@ consume(void *arg) {
 		goto STOP;
 	}
 
-	sha_cur = (sha_list *)sha_head;
 	while(sem_getvalue(&working, &sem_val) == 0 && sem_val == 0) {
 
 		/* head of sha list critical section */
 		pthread_mutex_lock(&head_lock);
 
+		sha_cur = (sha_list *)sha_head;
 		/* test predicate in a loop to guard against spurious wakeups */
 		while (!sha_cur->next) {
 			/* wait on list to be populate */
@@ -284,7 +283,6 @@ consume(void *arg) {
 			free(sha_head);
 			sha_head = sha_cur;
 
-			printf("%s \n %s",onion, search);
 			if(strncmp(onion, search, search_len) == 0) {
 #ifdef __SSSE3__
 				/* sanity check: my SSE algorithm is still experimental, so
@@ -452,7 +450,7 @@ main(int argc, char **argv) {
 		return 1;
 	}
 
-	consumers = calloc(thread_count, sizeof *consumers);
+	consumers = calloc((thread_count/4+1), sizeof *consumers);
 	if (!consumers) {
 		perror("consumer thread calloc");
 		free(producers);
@@ -477,7 +475,7 @@ main(int argc, char **argv) {
 	sha_head->next = NULL;
 
 	for (i = 0; i < thread_count; i++) {
-		if (pthread_create(&producers[i], NULL, produce, (void*)&khashes[i])) {
+		if (pthread_create(&producers[i], NULL, produce, (void *)&khashes[i])) {
 			perror("producers pthread_create");
 			free(producers);
 			free(consumers);
@@ -485,8 +483,8 @@ main(int argc, char **argv) {
 		}
 	}
 
-	for (i = 0; i < thread_count; i++) {
-		if (pthread_create(&consumers[i], NULL, consume, (void*)&khashes[i])) {
+	for (i = 0; i < (thread_count/4+1); i++) {
+		if (pthread_create(&consumers[i], NULL, consume, (void *)&khashes[i])) {
 			perror("consumers pthread_create");
 			free(producers);
 			free(consumers);
@@ -498,6 +496,9 @@ main(int argc, char **argv) {
 
 	for (i = 0; i < thread_count; i++) {
 		pthread_join(producers[i], NULL);
+	}
+
+	for (i = 0; i < (thread_count/4+1); i++) {
 		pthread_join(consumers[i], NULL);
 	}
 
@@ -507,14 +508,14 @@ main(int argc, char **argv) {
 	pthread_cond_destroy(&list_ready);
 
 	/* walk list and free each node */
-	sha_tmp = (sha_list *)sha_head;
+	sha_tmp = sha_head;
 	while (sha_tmp->next) {
 		sha_tmp = sha_tmp->next;
 		/* cast needed for volatile pointer */
-		free((void *)sha_head);
+		free(sha_head);
 		sha_head = sha_tmp;
 	}
-	free((void *)sha_head);
+		free(sha_head);
 
 	return 0;
 }
