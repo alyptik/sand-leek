@@ -7,6 +7,7 @@
 #include <errno.h>
 #include <string.h>
 #include <endian.h>
+#include <assert.h>
 #include <openssl/bn.h>
 #include <openssl/rsa.h>
 #include <openssl/sha.h>
@@ -24,6 +25,8 @@
 #define RSA_KEY_BITS          1024
 
 typedef struct sha_list_tag {
+	/* char *onion; */
+	/* unsigned char *sha; */
 	char onion[17];
 	unsigned char sha[20];
 	unsigned long e;
@@ -35,7 +38,7 @@ static char *search;
 static size_t search_len;
 sem_t working;
 
-volatile sha_list *sha_head;
+sha_list *sha_head;
 pthread_mutex_t head_lock, tail_lock;
 /* associated with the 'head_lock' mutex with the */
 /* predicate condition 'a sha hash in the queue' */
@@ -106,9 +109,6 @@ key_update_d(RSA *rsa_key) {
 void*
 produce(void *arg) {
 	char onion[17];
-#ifdef __SSSE3__
-	char check_onion[17]; /* buffer for onion address used in sanity check */
-#endif
 	unsigned char sha[20];
 	unsigned long e = EXPONENT_MIN;
 	unsigned int e_big_endian = 0;
@@ -122,7 +122,7 @@ produce(void *arg) {
 	SHA_CTX sha_c;
 	SHA_CTX working_sha_c;
 	int sem_val = 0;
-	sha_list *sha_tail;
+	sha_list *sha_tail = NULL;
 
 	rsa_key = RSA_new();
 	if (!rsa_key) {
@@ -165,11 +165,11 @@ produce(void *arg) {
 		free(der_data);
 
 		while (e < EXPONENT_MAX) {
-			memcpy(&working_sha_c, &sha_c, 10*sizeof(SHA_LONG)); /* FIXME magic */
+			memcpy(&working_sha_c, (const void *)&sha_c, 10*sizeof(SHA_LONG)); /* FIXME magic */
 			working_sha_c.num = sha_c.num;
 
 			e_big_endian = htobe32(e);
-			SHA1_Update(&working_sha_c, (const void *)&e_big_endian, EXPONENT_SIZE_BYTES);
+			SHA1_Update(&working_sha_c, &e_big_endian, EXPONENT_SIZE_BYTES);
 			SHA1_Final(sha, &working_sha_c);
 
 #ifdef __SSSE3__
@@ -180,6 +180,40 @@ produce(void *arg) {
 
 			onion[16] = '\0';
 
+			/* head of sha list critical section */
+			// pthread_mutex_lock(&head_lock);
+			/* tail of sha list critical section */
+			pthread_mutex_lock(&tail_lock);
+			sha_tail =  (sha_list *)sha_head;
+			if (!sha_tail->next) {
+				/* copy data into the structure and unlock mutexes */
+				memcpy((void *)sha_tail->onion, (const void *)onion, sizeof onion);
+				memcpy((void *)sha_tail->sha, (const void *)sha, sizeof sha);
+				sha_tail->e = e_big_endian;
+				sha_tail->rsa_key = rsa_key;
+				sha_tail->next = malloc(sizeof *sha_tail->next);
+				sha_head->next->next = NULL;
+				pthread_mutex_unlock(&tail_lock);
+				/* signal the list is non-empty */
+				pthread_cond_broadcast(&list_ready);
+			} else {
+				/* walk list */
+				while (sha_tail->next) {
+					sha_tail = sha_tail->next;
+				}
+
+				/* copy data into the structure and unlock mutexes */
+				memcpy((void *)sha_tail->onion, (const void *)onion, sizeof onion);
+				memcpy((void *)sha_tail->sha, (const void *)sha, sizeof sha);
+				sha_tail->e = e_big_endian;
+				sha_tail->rsa_key = rsa_key;
+				sha_tail->next = malloc(sizeof *sha_tail->next);
+				sha_head->next->next = NULL;
+				pthread_mutex_unlock(&tail_lock);
+				/* signal the list is non-empty */
+				pthread_cond_broadcast(&list_ready);
+			}
+
 			if (hashes++ >= 1000) {
 				hashes = 0;
 				(*kilo_hashes)++;
@@ -187,49 +221,6 @@ produce(void *arg) {
 				sem_getvalue(&working, &sem_val);
 				if (sem_val > 0)
 					goto STOP;
-			}
-
-			/* head of sha list critical section */
-			pthread_mutex_lock(&head_lock);
-			if (!sha_head) {
-				sha_head = malloc(sizeof *sha_head);
-			}
-			sha_tail = sha_head;
-
-			/* tail of sha list critical section */
-			pthread_mutex_lock(&tail_lock);
-			if (!sha_tail->next) {
-				/* copy data into the structure and unlock mutexes */
-				memcpy(sha_tail->onion, (const void *)onion, sizeof onion);
-				memcpy(sha_tail->sha, (const void *)sha, sizeof sha);
-				sha_tail->e = e_big_endian;
-				sha_tail->rsa_key = rsa_key;
-				sha_tail->next = malloc(sizeof *sha_tail->next);
-				pthread_mutex_unlock(&tail_lock);
-				pthread_mutex_unlock(&head_lock);
-				/* signal the list is non-empty */
-				pthread_cond_broadcast(&list_ready);
-			} else {
-				sha_tail = sha_tail->next;
-				pthread_mutex_unlock(&tail_lock);
-				pthread_mutex_unlock(&head_lock);
-				/* signal the list is non-empty */
-				pthread_cond_broadcast(&list_ready);
-				/* walk list */
-				while (sha_tail->next) {
-					sha_tail = sha_tail->next;
-				}
-
-				/* tail of sha list critical section */
-				pthread_mutex_lock(&tail_lock);
-				/* copy data into the structure and unlock mutexes */
-				memcpy(sha_tail->onion, (const void *)onion, sizeof onion);
-				memcpy(sha_tail->onion, onion, sizeof onion);
-				memcpy(sha_tail->sha, sha, sizeof sha);
-				sha_tail->e = e_big_endian;
-				sha_tail->rsa_key = rsa_key;
-				sha_tail->next = malloc(sizeof *sha_tail->next);
-				pthread_mutex_unlock(&tail_lock);
 			}
 
 			/* select next odd exponent */
@@ -248,34 +239,52 @@ consume(void *arg) {
 	char check_onion[17]; /* buffer for onion address used in sanity check */
 #endif
 	unsigned char sha[20];
-	unsigned long e;
+	unsigned long e = 0;
+	unsigned long volatile *kilo_hashes = arg;
+	unsigned long hashes = 0;
 	BIGNUM *bignum_e = NULL;
 	RSA *rsa_key = NULL;
-	int sem_val;
+	int sem_val = 0;
+	sha_list *sha_cur = NULL;
 
+	rsa_key = RSA_new();
+	if (!rsa_key) {
+		fprintf(stderr, "Failed to allocate RSA key\n");
+		goto STOP;
+	}
+
+	bignum_e = BN_new();
+	if (!bignum_e) {
+		fprintf(stderr, "Failed to allocate bignum for exponent\n");
+		goto STOP;
+	}
+
+	sha_cur = (sha_list *)sha_head;
 	while(sem_getvalue(&working, &sem_val) == 0 && sem_val == 0) {
 
 		/* head of sha list critical section */
 		pthread_mutex_lock(&head_lock);
 
 		/* test predicate in a loop to guard against spurious wakeups */
-		while (!sha_head) {
+		while (!sha_cur->next) {
 			/* wait on list to be populate */
 			pthread_cond_wait(&list_ready, &head_lock);
 		}
 
 		/* retest predicate */
-		if (!sha_head) {
+		if (!sha_cur->next) {
 			/* if false, unlock mutex and restart loop */
 			pthread_mutex_unlock(&head_lock);
 		} else {
-			memcpy(onion, (const void *)sha_head->onion, sizeof sha_head->onion);
-			memcpy(sha, (const void *)sha_head->sha, sizeof sha_head->sha);
-			e = sha_head->e;
-			rsa_key = sha_head->rsa_key;
-			sha_head = sha_head->next;
-			pthread_mutex_unlock(&head_lock);
+			memcpy((void *)onion, (const void *)sha_cur->onion, sizeof sha_cur->onion);
+			memcpy((void *)sha, (const void *)sha_cur->sha, sizeof sha_cur->sha);
+			e = sha_cur->e;
+			rsa_key = sha_cur->rsa_key;
+			sha_cur = sha_cur->next;
+			free(sha_head);
+			sha_head = sha_cur;
 
+			printf("%s \n %s",onion, search);
 			if(strncmp(onion, search, search_len) == 0) {
 #ifdef __SSSE3__
 				/* sanity check: my SSE algorithm is still experimental, so
@@ -300,7 +309,6 @@ consume(void *arg) {
 				}
 				RSA_set0_key(rsa_key, NULL, bignum_e, NULL);
 				/* allocate what was freed by above function call */
-				bignum_e = BN_new();
 #else
 				/* much tidier to be honest */
 				BN_set_word(rsa_key->e, e);
@@ -323,8 +331,21 @@ consume(void *arg) {
 				} else {
 					fprintf(stderr, "Key invalid:");
 					ERR_print_errors_fp(stderr);
+					goto STOP;
 				}
+
 			}
+
+			if (hashes++ >= 1000) {
+				hashes = 0;
+				(*kilo_hashes)++;
+				/* check if we should still be working too */
+				sem_getvalue(&working, &sem_val);
+				if (sem_val > 0)
+					goto STOP;
+			}
+
+			pthread_mutex_unlock(&head_lock);
 		}
 	}
 STOP:
@@ -391,10 +412,6 @@ main(int argc, char **argv) {
 	unsigned long volatile *khashes = NULL;
 	sha_list *sha_tmp;
 
-	pthread_mutex_init(&head_lock, NULL);
-	pthread_mutex_init(&tail_lock, NULL);
-	pthread_cond_init(&list_ready, NULL);
-
 	while ((opt = getopt(argc, argv, "t:s:V")) != -1) {
 		switch (opt) {
 		case 'V':
@@ -429,20 +446,20 @@ main(int argc, char **argv) {
 	}
 
 	/* allocate producers/consumers in a 3:1 ratio */
-	producers = calloc((thread_count / 4), sizeof *producers);
+	producers = calloc(thread_count, sizeof *producers);
 	if (!producers) {
 		perror("producer thread calloc");
 		return 1;
 	}
 
-	consumers = calloc((thread_count - (thread_count / 4)), sizeof *consumers);
+	consumers = calloc(thread_count, sizeof *consumers);
 	if (!consumers) {
 		perror("consumer thread calloc");
 		free(producers);
 		return 1;
 	}
 
-	khashes = calloc(thread_count, sizeof(khashes[0]));
+	khashes = calloc(thread_count, sizeof *khashes);
 	if (!khashes) {
 		perror("hash count array calloc");
 		free(producers);
@@ -452,7 +469,14 @@ main(int argc, char **argv) {
 
 	sem_init(&working, 0, 0);
 
-	for (i = 0; i < (thread_count / 4); i++) {
+	pthread_mutex_init(&head_lock, NULL);
+	pthread_mutex_init(&tail_lock, NULL);
+	pthread_cond_init(&list_ready, NULL);
+
+	sha_head = malloc(sizeof *sha_head);
+	sha_head->next = NULL;
+
+	for (i = 0; i < thread_count; i++) {
 		if (pthread_create(&producers[i], NULL, produce, (void*)&khashes[i])) {
 			perror("producers pthread_create");
 			free(producers);
@@ -461,7 +485,7 @@ main(int argc, char **argv) {
 		}
 	}
 
-	for (i = 0; i < (thread_count - (thread_count / 4)); i++) {
+	for (i = 0; i < thread_count; i++) {
 		if (pthread_create(&consumers[i], NULL, consume, (void*)&khashes[i])) {
 			perror("consumers pthread_create");
 			free(producers);
@@ -477,17 +501,20 @@ main(int argc, char **argv) {
 		pthread_join(consumers[i], NULL);
 	}
 
+	/* cleanup mutexes and condition vars */
 	pthread_mutex_destroy(&head_lock);
 	pthread_mutex_destroy(&tail_lock);
 	pthread_cond_destroy(&list_ready);
 
-	sha_tmp = sha_head;
+	/* walk list and free each node */
+	sha_tmp = (sha_list *)sha_head;
 	while (sha_tmp->next) {
 		sha_tmp = sha_tmp->next;
-		free(sha_head);
+		/* cast needed for volatile pointer */
+		free((void *)sha_head);
 		sha_head = sha_tmp;
 	}
-	free(sha_head);
+	free((void *)sha_head);
 
 	return 0;
 }
