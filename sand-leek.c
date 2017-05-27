@@ -317,9 +317,6 @@ consume(void *arg) {
 
 			}
 
-			/* end head of sha list critical section */
-			pthread_mutex_unlock(&head_lock);
-
 			if (hashes++ >= 1000) {
 				hashes = 0;
 				/* check if we should still be working too */
@@ -327,6 +324,9 @@ consume(void *arg) {
 				if (sem_val > 0)
 					goto STOP;
 			}
+
+			/* end head of sha list critical section */
+			pthread_mutex_unlock(&head_lock);
 		}
 	}
 STOP:
@@ -429,14 +429,14 @@ main(int argc, char **argv) {
 		return 1;
 	}
 
-	/* allocate producers/consumers in a 3:1 ratio */
 	producers = calloc(thread_count, sizeof *producers);
 	if (!producers) {
 		perror("producer thread calloc");
 		return 1;
 	}
 
-	consumers = calloc((thread_count/4+1), sizeof *consumers);
+	/* allocate producers/consumers in an 8:1 ratio */
+	consumers = calloc((thread_count/8+1), sizeof *consumers);
 	if (!consumers) {
 		perror("consumer thread calloc");
 		free(producers);
@@ -479,7 +479,7 @@ main(int argc, char **argv) {
 		}
 	}
 
-	for (i = 0; i < (thread_count/4+1); i++) {
+	for (i = 0; i < (thread_count/8+1); i++) {
 		if (pthread_create(&consumers[i], NULL, consume, (void *)&khashes[i])) {
 			perror("consumers pthread_create");
 
@@ -503,7 +503,7 @@ main(int argc, char **argv) {
 		pthread_join(producers[i], NULL);
 	}
 
-	for (i = 0; i < (thread_count/4+1); i++) {
+	for (i = 0; i < (thread_count/8+1); i++) {
 		pthread_join(consumers[i], NULL);
 	}
 
